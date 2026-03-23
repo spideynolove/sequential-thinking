@@ -1,31 +1,21 @@
-from typing import Optional, List, Dict, Any
-from datetime import datetime
+import sqlite3
+import json
 import importlib.metadata
 import re
 import logging
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from typing import Optional, List, Dict, Any
+
 from models import (
-    UnifiedSession,
-    Memory,
-    Thought,
-    Branch,
-    ArchitectureDecision,
-    PackageInfo,
-    SessionType,
-    ThoughtStage,
-    ThoughtType,
+    UnifiedSession, Memory, Thought, Branch,
+    ArchitectureDecision, PackageInfo, Assumption, SessionType, ThoughtStage, ThoughtType,
 )
 from errors import (
-    SessionError,
-    NoActiveSessionError,
-    SessionNotFoundError,
-    ValidationError,
-    StorageError,
-    MemoryError,
-    BranchError,
-    PackageExplorationError,
+    SessionError, NoActiveSessionError, SessionNotFoundError,
+    ValidationError, StorageError, BranchError,
 )
-
 
 MAX_THOUGHTS_PER_SESSION = 500
 MAX_BRANCHES_PER_SESSION = 50
@@ -55,30 +45,343 @@ class UnifiedSessionManager:
     def __init__(self, memory_bank_path: str = "memory-bank"):
         self.logger = logging.getLogger(__name__)
         self.memory_bank_path = Path(memory_bank_path)
-        self.sessions_dir = self.memory_bank_path / "sessions"
-        self.memories_dir = self.memory_bank_path / "memories"
-        self.patterns_dir = self.memory_bank_path / "patterns"
-        self.index_file = self.memory_bank_path / "index.md"
+        self.db_path = self.memory_bank_path / "sessions.db"
         self.current_session: Optional[UnifiedSession] = None
-
         try:
-            self._ensure_directories()
+            self._init_db()
             self._load_last_active_session()
         except Exception as e:
             self.logger.error(f"Failed to initialize session manager: {e}")
             raise StorageError(f"Could not initialize memory bank at {memory_bank_path}: {e}")
 
-    def _ensure_directories(self):
+    def _init_db(self) -> None:
         self.memory_bank_path.mkdir(exist_ok=True)
-        self.sessions_dir.mkdir(exist_ok=True)
-        self.memories_dir.mkdir(exist_ok=True)
-        self.patterns_dir.mkdir(exist_ok=True)
-        if not self.index_file.exists():
-            self._create_index_file()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    problem TEXT NOT NULL,
+                    success_criteria TEXT NOT NULL,
+                    constraints TEXT NOT NULL DEFAULT '',
+                    session_type TEXT NOT NULL DEFAULT 'general',
+                    codebase_context TEXT NOT NULL DEFAULT '',
+                    package_exploration_required INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS thoughts (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    branch_id TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.8,
+                    dependencies TEXT NOT NULL DEFAULT '',
+                    explore_packages INTEGER NOT NULL DEFAULT 0,
+                    suggested_packages TEXT NOT NULL DEFAULT '',
+                    thought_number INTEGER,
+                    total_thoughts INTEGER,
+                    is_revision INTEGER NOT NULL DEFAULT 0,
+                    revises_thought_id TEXT NOT NULL DEFAULT '',
+                    next_thought_needed INTEGER NOT NULL DEFAULT 1,
+                    stage TEXT,
+                    tags TEXT NOT NULL DEFAULT '',
+                    axioms_used TEXT NOT NULL DEFAULT '',
+                    assumptions_challenged TEXT NOT NULL DEFAULT '',
+                    left_to_be_done TEXT NOT NULL DEFAULT '',
+                    uncertainty_notes TEXT NOT NULL DEFAULT '',
+                    outcome TEXT NOT NULL DEFAULT '',
+                    assumptions TEXT NOT NULL DEFAULT '',
+                    depends_on_assumptions TEXT NOT NULL DEFAULT '',
+                    invalidates_assumptions TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS branches (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    name TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    from_thought_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    content TEXT NOT NULL,
+                    tags TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL DEFAULT 0.8,
+                    importance REAL NOT NULL DEFAULT 0.5,
+                    dependencies TEXT NOT NULL DEFAULT '',
+                    code_snippet TEXT NOT NULL DEFAULT '',
+                    language TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS architecture_decisions (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    decision_title TEXT NOT NULL,
+                    context TEXT NOT NULL,
+                    options_considered TEXT NOT NULL,
+                    chosen_option TEXT NOT NULL,
+                    rationale TEXT NOT NULL,
+                    consequences TEXT NOT NULL,
+                    package_dependencies TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS discovered_packages (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    name TEXT NOT NULL,
+                    version TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    api_signatures TEXT NOT NULL DEFAULT '[]',
+                    relevance_score REAL NOT NULL DEFAULT 0.0,
+                    installation_status TEXT NOT NULL DEFAULT '',
+                    discovered_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS assumptions (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    text TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.8,
+                    critical INTEGER NOT NULL DEFAULT 0,
+                    verifiable INTEGER NOT NULL DEFAULT 0,
+                    evidence TEXT NOT NULL DEFAULT '',
+                    verification_status TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
 
-    def _create_index_file(self):
-        content = "# Session Registry\n\n## Active Sessions\n\n## Archived Sessions\n\n## Memory Collections\n\n## Code Patterns\n\n---\n*Updated: Generated by Sequential Thinking MCP v2*"
-        self.index_file.write_text(content)
+    @contextmanager
+    def _conn(self):
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _upsert_session(self, session: UnifiedSession) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO sessions
+                   (id, problem, success_criteria, constraints, session_type,
+                    codebase_context, package_exploration_required, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session.id, session.problem, session.success_criteria, session.constraints,
+                 session.session_type.value, session.codebase_context,
+                 int(session.package_exploration_required),
+                 session.created_at.isoformat(), session.updated_at.isoformat()),
+            )
+
+    def _touch_session(self, session_id: str) -> None:
+        now = datetime.now()
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (now.isoformat(), session_id),
+            )
+        if self.current_session and self.current_session.id == session_id:
+            self.current_session.updated_at = now
+
+    def _insert_thought(self, thought: Thought) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO thoughts
+                   (id, session_id, branch_id, content, confidence, dependencies,
+                    explore_packages, suggested_packages, thought_number, total_thoughts,
+                    is_revision, revises_thought_id, next_thought_needed, stage, tags,
+                    axioms_used, assumptions_challenged, left_to_be_done, uncertainty_notes,
+                    outcome, assumptions, depends_on_assumptions, invalidates_assumptions, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (thought.id, thought.session_id, thought.branch_id, thought.content,
+                 thought.confidence, ",".join(thought.dependencies),
+                 int(thought.explore_packages), ",".join(thought.suggested_packages),
+                 thought.thought_number, thought.total_thoughts,
+                 int(thought.is_revision), thought.revises_thought_id,
+                 int(thought.next_thought_needed),
+                 thought.stage.value if thought.stage else None,
+                 ",".join(thought.tags), thought.axioms_used, thought.assumptions_challenged,
+                 thought.left_to_be_done, thought.uncertainty_notes, thought.outcome,
+                 ",".join(thought.assumptions), ",".join(thought.depends_on_assumptions),
+                 ",".join(thought.invalidates_assumptions),
+                 thought.created_at.isoformat(), thought.updated_at.isoformat()),
+            )
+
+    def _insert_branch(self, branch: Branch) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO branches (id, session_id, name, purpose, from_thought_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (branch.id, branch.session_id, branch.name, branch.purpose,
+                 branch.from_thought_id, branch.created_at.isoformat()),
+            )
+
+    def _insert_memory(self, memory: Memory) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO memories
+                   (id, session_id, content, tags, confidence, importance, dependencies,
+                    code_snippet, language, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (memory.id, memory.session_id, memory.content, ",".join(memory.tags),
+                 memory.confidence, memory.importance, ",".join(memory.dependencies),
+                 memory.code_snippet, memory.language,
+                 memory.created_at.isoformat(), memory.updated_at.isoformat()),
+            )
+
+    def _insert_decision(self, decision: ArchitectureDecision) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO architecture_decisions
+                   (id, session_id, decision_title, context, options_considered, chosen_option,
+                    rationale, consequences, package_dependencies, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (decision.id, decision.session_id, decision.decision_title, decision.context,
+                 decision.options_considered, decision.chosen_option, decision.rationale,
+                 decision.consequences, ",".join(decision.package_dependencies),
+                 decision.created_at.isoformat()),
+            )
+
+    def _insert_package(self, package: PackageInfo) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO discovered_packages
+                   (id, session_id, name, version, description, api_signatures,
+                    relevance_score, installation_status, discovered_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (package.id, package.session_id, package.name, package.version,
+                 package.description, json.dumps(package.api_signatures),
+                 package.relevance_score, package.installation_status,
+                 package.discovered_at.isoformat()),
+            )
+
+    def _insert_assumption(self, assumption: Assumption) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO assumptions
+                   (id, session_id, text, confidence, critical, verifiable, evidence, verification_status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (assumption.id, assumption.session_id, assumption.text,
+                 assumption.confidence, int(assumption.critical), int(assumption.verifiable),
+                 assumption.evidence, assumption.verification_status, datetime.now().isoformat()),
+            )
+
+    def _row_to_thought(self, row) -> Thought:
+        return Thought(
+            id=row["id"],
+            session_id=row["session_id"],
+            branch_id=row["branch_id"] or "",
+            content=row["content"],
+            confidence=row["confidence"],
+            dependencies=[d for d in (row["dependencies"] or "").split(",") if d],
+            explore_packages=bool(row["explore_packages"]),
+            suggested_packages=[p for p in (row["suggested_packages"] or "").split(",") if p],
+            thought_number=row["thought_number"],
+            total_thoughts=row["total_thoughts"],
+            is_revision=bool(row["is_revision"]),
+            revises_thought_id=row["revises_thought_id"] or "",
+            next_thought_needed=bool(row["next_thought_needed"]),
+            stage=ThoughtStage.from_string(row["stage"]) if row["stage"] else None,
+            tags=[t for t in (row["tags"] or "").split(",") if t],
+            axioms_used=row["axioms_used"] or "",
+            assumptions_challenged=row["assumptions_challenged"] or "",
+            left_to_be_done=row["left_to_be_done"] or "",
+            uncertainty_notes=row.get("uncertainty_notes") or "",
+            outcome=row.get("outcome") or "",
+            assumptions=[a for a in (row.get("assumptions") or "").split(",") if a],
+            depends_on_assumptions=[a for a in (row.get("depends_on_assumptions") or "").split(",") if a],
+            invalidates_assumptions=[a for a in (row.get("invalidates_assumptions") or "").split(",") if a],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def _row_to_memory(self, row) -> Memory:
+        return Memory(
+            id=row["id"],
+            session_id=row["session_id"],
+            content=row["content"],
+            tags=[t for t in (row["tags"] or "").split(",") if t],
+            confidence=row["confidence"],
+            importance=row["importance"],
+            dependencies=[d for d in (row["dependencies"] or "").split(",") if d],
+            code_snippet=row["code_snippet"] or "",
+            language=row["language"] or "",
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def _row_to_branch(self, row) -> Branch:
+        return Branch(
+            id=row["id"],
+            name=row["name"],
+            purpose=row["purpose"],
+            session_id=row["session_id"],
+            from_thought_id=row["from_thought_id"] or "",
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def _row_to_decision(self, row) -> ArchitectureDecision:
+        return ArchitectureDecision(
+            id=row["id"],
+            session_id=row["session_id"],
+            decision_title=row["decision_title"],
+            context=row["context"],
+            options_considered=row["options_considered"],
+            chosen_option=row["chosen_option"],
+            rationale=row["rationale"],
+            consequences=row["consequences"],
+            package_dependencies=[p for p in (row["package_dependencies"] or "").split(",") if p],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def _row_to_package(self, row) -> PackageInfo:
+        return PackageInfo(
+            id=row["id"],
+            name=row["name"],
+            version=row["version"] or "",
+            description=row["description"] or "",
+            api_signatures=json.loads(row["api_signatures"] or "[]"),
+            relevance_score=row["relevance_score"],
+            installation_status=row["installation_status"] or "",
+            session_id=row["session_id"],
+            discovered_at=datetime.fromisoformat(row["discovered_at"]),
+        )
+
+    def _row_to_assumption(self, row) -> Assumption:
+        return Assumption(
+            id=row["id"],
+            session_id=row["session_id"],
+            text=row["text"],
+            confidence=row["confidence"],
+            critical=bool(row["critical"]),
+            verifiable=bool(row["verifiable"]),
+            evidence=row.get("evidence") or "",
+            verification_status=row.get("verification_status") or "",
+        )
 
     def start_session(
         self,
@@ -89,9 +392,7 @@ class UnifiedSessionManager:
         codebase_context: str = "",
         package_exploration_required: bool = True,
     ) -> str:
-        session_type_enum = (
-            SessionType.CODING if session_type == "coding" else SessionType.GENERAL
-        )
+        session_type_enum = SessionType.CODING if session_type == "coding" else SessionType.GENERAL
         session = UnifiedSession(
             problem=problem,
             success_criteria=success_criteria,
@@ -100,144 +401,11 @@ class UnifiedSessionManager:
             codebase_context=codebase_context,
             package_exploration_required=package_exploration_required,
         )
-        session_id = self._save_session_to_file(session)
+        self._upsert_session(session)
         self.current_session = session
         if package_exploration_required and session_type == "coding":
             self.explore_packages(problem)
-        return session_id
-
-    def _save_session_to_file(self, session: UnifiedSession) -> str:
-        session_file = self.sessions_dir / f"{session.id}.md"
-
-        # Build thoughts section
-        thoughts_content = ""
-        for i, thought in enumerate(session.thoughts, 1):
-            branch_info = f" (Branch: {thought.branch_id})" if thought.branch_id else ""
-            thoughts_content += f"### Thought {i}{branch_info}\n\n"
-            thoughts_content += f"**ID:** {thought.id}\n"
-            thoughts_content += f"**Confidence:** {thought.confidence}\n"
-            if thought.thought_number is not None:
-                thoughts_content += f"**Thought:** {thought.thought_number}/{thought.total_thoughts}\n"
-            if thought.is_revision:
-                thoughts_content += f"**Revision of:** {thought.revises_thought_id}\n"
-            if not thought.next_thought_needed:
-                thoughts_content += f"**Next Needed:** False\n"
-            if thought.stage:
-                thoughts_content += f"**Stage:** {thought.stage.value}\n"
-            if thought.tags:
-                thoughts_content += f"**Tags:** {', '.join(thought.tags)}\n"
-            if thought.axioms_used:
-                thoughts_content += f"**Axioms:** {thought.axioms_used}\n"
-            if thought.assumptions_challenged:
-                thoughts_content += f"**Assumptions:** {thought.assumptions_challenged}\n"
-            if thought.left_to_be_done:
-                thoughts_content += f"**Left to do:** {thought.left_to_be_done}\n"
-            thoughts_content += f"**Created:** {thought.created_at.isoformat()}\n\n"
-            thoughts_content += f"{thought.content}\n\n"
-            if thought.dependencies:
-                thoughts_content += f"**Dependencies:** {', '.join(thought.dependencies)}\n\n"
-            if thought.suggested_packages:
-                thoughts_content += f"**Suggested Packages:** {', '.join(thought.suggested_packages)}\n\n"
-            thoughts_content += "---\n\n"
-
-        # Build memories section
-        memories_content = ""
-        for memory in session.memories:
-            memories_content += f"### {memory.content[:50]}...\n\n"
-            memories_content += f"**ID:** {memory.id}\n"
-            memories_content += f"**Confidence:** {memory.confidence}\n"
-            memories_content += f"**Tags:** {', '.join(memory.tags)}\n\n"
-            if memory.code_snippet:
-                memories_content += f"**Code:**\n```{memory.language}\n{memory.code_snippet}\n```\n\n"
-            memories_content += "---\n\n"
-
-        # Build architecture decisions section
-        decisions_content = ""
-        for decision in session.architecture_decisions:
-            decisions_content += f"### {decision.decision_title}\n\n"
-            decisions_content += f"**ID:** {decision.id}\n"
-            decisions_content += f"**Context:** {decision.context}\n\n"
-            decisions_content += f"**Options Considered:** {decision.options_considered}\n\n"
-            decisions_content += f"**Chosen Option:** {decision.chosen_option}\n\n"
-            decisions_content += f"**Rationale:** {decision.rationale}\n\n"
-            decisions_content += f"**Consequences:** {decision.consequences}\n\n"
-            if decision.package_dependencies:
-                decisions_content += f"**Package Dependencies:** {', '.join(decision.package_dependencies)}\n\n"
-            decisions_content += "---\n\n"
-
-        # Build packages section
-        packages_content = ""
-        for package in session.discovered_packages:
-            packages_content += f"### {package.name} v{package.version}\n\n"
-            packages_content += f"**Relevance Score:** {package.relevance_score}\n"
-            packages_content += f"**Status:** {package.installation_status}\n"
-            if package.api_signatures:
-                packages_content += f"**API Signatures:**\n"
-                for sig in package.api_signatures:
-                    packages_content += f"- `{sig}`\n"
-            packages_content += "\n---\n\n"
-
-        content = f"""# {session.problem}
-
-**Session ID:** {session.id}
-**Type:** {session.session_type.value}
-**Created:** {session.created_at.isoformat()}
-**Updated:** {session.updated_at.isoformat()}
-
-## Problem Statement
-{session.problem}
-
-## Success Criteria
-{session.success_criteria}
-
-## Constraints
-{session.constraints}
-
-## Codebase Context
-{session.codebase_context}
-
-## Thoughts ({len(session.thoughts)})
-
-{thoughts_content}
-
-## Memories ({len(session.memories)})
-
-{memories_content}
-
-## Architecture Decisions ({len(session.architecture_decisions)})
-
-{decisions_content}
-
-## Discovered Packages ({len(session.discovered_packages)})
-
-{packages_content}
-
----
-*Session data stored in markdown format*
-"""
-
-        try:
-            session_file.write_text(content)
-            self._update_index_with_session(session)
-            return session.id
-        except Exception as e:
-            self.logger.error(f"Failed to save session to file: {e}")
-            raise StorageError(f"Could not save session {session.id}: {e}")
-
-    def _update_index_with_session(self, session: UnifiedSession):
-        if not self.index_file.exists():
-            self._create_index_file()
-        current_content = self.index_file.read_text()
-        session_entry = f"- **{session.id}**: {session.problem} ({session.session_type.value}, {session.created_at.strftime('%Y-%m-%d')})"
-        if session.id in current_content:
-            return
-        new_content = current_content.replace(
-            "## Active Sessions\n\n", f"## Active Sessions\n\n{session_entry}\n\n"
-        )
-        new_content = new_content.replace(
-            "*Updated:", f"*Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} -"
-        )
-        self.index_file.write_text(new_content)
+        return session.id
 
     def add_thought(
         self,
@@ -256,28 +424,44 @@ class UnifiedSessionManager:
         axioms_used: str = "",
         assumptions_challenged: str = "",
         left_to_be_done: str = "",
+        uncertainty_notes: str = "",
+        outcome: str = "",
+        assumptions: str = "",
+        depends_on_assumptions: str = "",
+        invalidates_assumptions: str = "",
     ) -> str:
         if not self.current_session:
             raise NoActiveSessionError("Cannot add thought without an active session")
-
         try:
             if not (0 <= confidence <= 1):
                 raise ValidationError("Thought confidence must be between 0 and 1")
-
             content = _sanitize_input(content, MAX_THOUGHT_CONTENT_LENGTH, "content")
-
             if len(self.current_session.thoughts) >= MAX_THOUGHTS_PER_SESSION:
                 raise ValidationError(f"Session thought limit ({MAX_THOUGHTS_PER_SESSION}) reached")
-
             if branch_id:
                 branch_thoughts = sum(1 for t in self.current_session.thoughts if t.branch_id == branch_id)
                 if branch_thoughts >= MAX_THOUGHTS_PER_BRANCH:
                     raise ValidationError(f"Branch thought limit ({MAX_THOUGHTS_PER_BRANCH}) reached")
 
+            assumption_ids: List[str] = []
+            if assumptions:
+                for assumption_text in [a.strip() for a in assumptions.split(",") if a.strip()]:
+                    assumption = Assumption(
+                        session_id=self.current_session.id,
+                        text=assumption_text,
+                        confidence=confidence,
+                    )
+                    self._insert_assumption(assumption)
+                    assumption_ids.append(assumption.id)
+
+            if invalidates_assumptions:
+                for invalid_id in [i.strip() for i in invalidates_assumptions.split(",") if i.strip()]:
+                    self.verify_assumption(invalid_id, False)
+
             thought = Thought(
                 session_id=self.current_session.id,
                 branch_id=branch_id,
-                content=content.strip(),
+                content=content,
                 confidence=confidence,
                 dependencies=dependencies,
                 explore_packages=explore_packages,
@@ -291,19 +475,22 @@ class UnifiedSessionManager:
                 axioms_used=axioms_used,
                 assumptions_challenged=assumptions_challenged,
                 left_to_be_done=left_to_be_done,
+                uncertainty_notes=uncertainty_notes,
+                outcome=outcome,
+                assumptions=assumption_ids,
+                depends_on_assumptions=[d.strip() for d in depends_on_assumptions.split(",") if d.strip()],
+                invalidates_assumptions=[i.strip() for i in invalidates_assumptions.split(",") if i.strip()],
             )
-
             if explore_packages and self.current_session.session_type == SessionType.CODING:
                 try:
                     thought.suggested_packages = self._suggest_packages(content)
                 except Exception as e:
                     self.logger.warning(f"Package exploration failed: {e}")
                     thought.suggested_packages = []
-
             self.current_session.thoughts.append(thought)
-            self._save_session_to_file(self.current_session)
+            self._insert_thought(thought)
+            self._touch_session(self.current_session.id)
             return thought.id
-
         except ValidationError:
             raise
         except Exception as e:
@@ -313,20 +500,15 @@ class UnifiedSessionManager:
     def create_branch(self, name: str, from_thought: str, purpose: str) -> str:
         if not self.current_session:
             raise NoActiveSessionError("Cannot create branch without an active session")
-
         try:
             if not name or not name.strip():
                 raise ValidationError("Branch name cannot be empty")
-
             if not purpose or not purpose.strip():
                 raise ValidationError("Branch purpose cannot be empty")
-
             if not from_thought or not from_thought.strip():
                 raise ValidationError("Branch must reference a valid thought ID")
-
             if len(self.current_session.branches) >= MAX_BRANCHES_PER_SESSION:
                 raise ValidationError(f"Session branch limit ({MAX_BRANCHES_PER_SESSION}) reached")
-
             branch = Branch(
                 name=name.strip(),
                 purpose=purpose.strip(),
@@ -334,9 +516,9 @@ class UnifiedSessionManager:
                 from_thought_id=from_thought.strip(),
             )
             self.current_session.branches.append(branch)
-            self._save_session_to_file(self.current_session)
+            self._insert_branch(branch)
+            self._touch_session(self.current_session.id)
             return branch.id
-
         except ValidationError:
             raise
         except Exception as e:
@@ -346,11 +528,9 @@ class UnifiedSessionManager:
     def merge_branch(self, branch_id: str, target_thought: str = "") -> str:
         if not self.current_session:
             raise NoActiveSessionError("Cannot merge branch without an active session")
-
         try:
             if not branch_id or not branch_id.strip():
                 raise ValidationError("Branch ID cannot be empty")
-
             branch_found = False
             for branch in self.current_session.branches:
                 if branch.id == branch_id:
@@ -361,15 +541,18 @@ class UnifiedSessionManager:
                             if thought.id == target_thought:
                                 thought.content += f"\n[Merged from {branch.name}]"
                                 thought_found = True
+                                with self._conn() as conn:
+                                    conn.execute(
+                                        "UPDATE thoughts SET content = ?, updated_at = ? WHERE id = ?",
+                                        (thought.content, datetime.now().isoformat(), thought.id),
+                                    )
                                 break
                         if not thought_found:
                             raise ValidationError(f"Target thought '{target_thought}' not found")
-                    self._save_session_to_file(self.current_session)
+                    self._touch_session(self.current_session.id)
                     return branch_id
-
             if not branch_found:
                 raise BranchError(f"Branch '{branch_id}' not found")
-
         except (ValidationError, BranchError):
             raise
         except Exception as e:
@@ -395,46 +578,15 @@ class UnifiedSessionManager:
             tags=tags.split(",") if tags else [],
         )
         self.current_session.memories.append(memory)
-        self._save_memory_to_file(memory)
-        self._save_session_to_file(self.current_session)
+        self._insert_memory(memory)
+        self._touch_session(self.current_session.id)
         return memory.id
-
-    def _save_memory_to_file(self, memory: Memory):
-        memory_file = self.memories_dir / f"{memory.id}.md"
-        content = f"""# {memory.content[:50]}...
-
-**Memory ID:** {memory.id}
-**Session ID:** {memory.session_id}
-**Created:** {memory.created_at.isoformat()}
-**Updated:** {memory.updated_at.isoformat()}
-**Confidence:** {memory.confidence}
-
-## Content
-{memory.content}
-
-## Code Snippet
-```{memory.language}
-{memory.code_snippet}
-```
-
-## Tags
-{', '.join(memory.tags)}
-
----
-*Memory stored in markdown format*
-"""
-        memory_file.write_text(content)
 
     def query_memories(
         self, tags: str = "", content_contains: str = ""
     ) -> List[Dict[str, Any]]:
-        import re
-        from datetime import datetime
-
         if not self.current_session:
             return []
-        if not self.current_session.memories:
-            self._load_session_memories(self.current_session.id)
         tag_filter_type = "any"
         if tags and ("&" in tags or "|" in tags):
             if "&" in tags:
@@ -515,9 +667,7 @@ class UnifiedSessionManager:
         try:
             for dist in importlib.metadata.distributions():
                 package_name = dist.metadata["name"]
-                relevance_score = self._calculate_relevance(
-                    package_name, task_description
-                )
+                relevance_score = self._calculate_relevance(package_name, task_description)
                 if relevance_score > 0.3:
                     package = PackageInfo(
                         name=package_name,
@@ -528,10 +678,11 @@ class UnifiedSessionManager:
                         session_id=self.current_session.id,
                     )
                     self.current_session.discovered_packages.append(package)
+                    self._insert_package(package)
                     installed_packages.append(package_name)
         except Exception:
             pass
-        self._save_session_to_file(self.current_session)
+        self._touch_session(self.current_session.id)
         return installed_packages
 
     def record_decision(
@@ -559,7 +710,8 @@ class UnifiedSessionManager:
             ),
         )
         self.current_session.architecture_decisions.append(decision)
-        self._save_session_to_file(self.current_session)
+        self._insert_decision(decision)
+        self._touch_session(self.current_session.id)
         return decision.id
 
     def analyze_session(self) -> Dict[str, Any]:
@@ -578,88 +730,74 @@ class UnifiedSessionManager:
         }
 
     def list_sessions(self) -> List[Dict[str, Any]]:
-        sessions = []
         try:
-            if self.index_file.exists():
-                import re
-
-                index_content = self.index_file.read_text()
-                active_section = re.search(
-                    "## Active Sessions\\n\\n(.*?)(?=\\n##|$)", index_content, re.DOTALL
-                )
-                if active_section:
-                    active_entries = re.findall(
-                        "- \\*\\*([\\w\\-]+)\\*\\*: (.*?) \\((\\w+), ([\\d\\-]+)\\)",
-                        active_section.group(1),
-                    )
-                    for entry in active_entries:
-                        session_id, problem, session_type, date = entry
-                        session_file = self.sessions_dir / f"{session_id}.md"
-                        if session_file.exists():
-                            sessions.append(
-                                {
-                                    "id": session_id,
-                                    "problem": problem,
-                                    "type": session_type,
-                                    "file": str(session_file),
-                                    "created": session_file.stat().st_ctime,
-                                }
-                            )
-            if not sessions:
-                for session_file in self.sessions_dir.glob("*.md"):
-                    session_id = session_file.stem
-                    try:
-                        content = session_file.read_text()
-                        import re
-
-                        problem_match = re.search("# (.*?)\\n", content)
-                        problem = (
-                            problem_match.group(1)
-                            if problem_match
-                            else "Unnamed session"
-                        )
-                        sessions.append(
-                            {
-                                "id": session_id,
-                                "problem": problem,
-                                "file": str(session_file),
-                                "created": session_file.stat().st_ctime,
-                            }
-                        )
-                    except Exception:
-                        sessions.append(
-                            {
-                                "id": session_id,
-                                "file": str(session_file),
-                                "created": session_file.stat().st_ctime,
-                            }
-                        )
+            with self._conn() as conn:
+                rows = conn.execute(
+                    "SELECT id, problem, session_type, created_at FROM sessions ORDER BY updated_at DESC"
+                ).fetchall()
+            return [
+                {"id": r["id"], "problem": r["problem"], "type": r["session_type"], "created": r["created_at"]}
+                for r in rows
+            ]
         except Exception:
-            pass
-        return sorted(sessions, key=lambda x: x["created"], reverse=True)
+            return []
 
     def load_session(self, session_id: str) -> Dict[str, Any]:
         try:
             if not session_id or not session_id.strip():
                 raise ValidationError("Session ID cannot be empty")
-
-            session_file = self.sessions_dir / f"{session_id}.md"
-            if not session_file.exists():
-                raise SessionNotFoundError(f"Session {session_id} not found")
-
-            content = session_file.read_text()
-            session = self._parse_session_markdown(content, session_id)
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if not row:
+                    raise SessionNotFoundError(f"Session {session_id} not found")
+                session = UnifiedSession(
+                    id=row["id"],
+                    problem=row["problem"],
+                    success_criteria=row["success_criteria"],
+                    constraints=row["constraints"] or "",
+                    session_type=SessionType.CODING if row["session_type"] == "coding" else SessionType.GENERAL,
+                    codebase_context=row["codebase_context"] or "",
+                    package_exploration_required=bool(row["package_exploration_required"]),
+                    created_at=datetime.fromisoformat(row["created_at"]),
+                    updated_at=datetime.fromisoformat(row["updated_at"]),
+                )
+                thought_rows = conn.execute(
+                    "SELECT * FROM thoughts WHERE session_id = ? ORDER BY created_at", (session_id,)
+                ).fetchall()
+                session.thoughts = [self._row_to_thought(r) for r in thought_rows]
+                branch_rows = conn.execute(
+                    "SELECT * FROM branches WHERE session_id = ? ORDER BY created_at", (session_id,)
+                ).fetchall()
+                session.branches = [self._row_to_branch(r) for r in branch_rows]
+                memory_rows = conn.execute(
+                    "SELECT * FROM memories WHERE session_id = ? ORDER BY created_at", (session_id,)
+                ).fetchall()
+                session.memories = [self._row_to_memory(r) for r in memory_rows]
+                decision_rows = conn.execute(
+                    "SELECT * FROM architecture_decisions WHERE session_id = ? ORDER BY created_at", (session_id,)
+                ).fetchall()
+                session.architecture_decisions = [self._row_to_decision(r) for r in decision_rows]
+                package_rows = conn.execute(
+                    "SELECT * FROM discovered_packages WHERE session_id = ? ORDER BY discovered_at", (session_id,)
+                ).fetchall()
+                session.discovered_packages = [self._row_to_package(r) for r in package_rows]
+                assumption_rows = conn.execute(
+                    "SELECT * FROM assumptions WHERE session_id = ?", (session_id,)
+                ).fetchall()
+                for ar in assumption_rows:
+                    assumption = self._row_to_assumption(ar)
+                    if not hasattr(session, "_assumptions"):
+                        session._assumptions = {}
+                    session._assumptions[assumption.id] = assumption
             self.current_session = session
-            self._load_session_memories(session_id)
-
             return {
                 "session_id": session_id,
                 "status": "loaded",
                 "thoughts_count": len(session.thoughts),
                 "memories_count": len(session.memories),
-                "file": str(session_file),
             }
-
         except (ValidationError, SessionNotFoundError):
             raise
         except Exception as e:
@@ -692,205 +830,64 @@ class UnifiedSessionManager:
             return 0.5
         return 0.1
 
-    def _parse_session_markdown(self, content: str, session_id: str) -> UnifiedSession:
-        import re
-        from datetime import datetime
-
-        session = UnifiedSession()
-        session.id = session_id
-
-        # Parse basic session metadata
-        session_type_match = re.search("\\*\\*Type:\\*\\* (\\w+)", content)
-        if session_type_match:
-            session_type_value = session_type_match.group(1)
-            session.session_type = (
-                SessionType.CODING
-                if session_type_value == "coding"
-                else SessionType.GENERAL
-            )
-
-        created_match = re.search("\\*\\*Created:\\*\\* ([\\d\\-T:\\.]+)", content)
-        if created_match:
-            try:
-                session.created_at = datetime.fromisoformat(created_match.group(1))
-            except ValueError:
-                pass
-
-        updated_match = re.search("\\*\\*Updated:\\*\\* ([\\d\\-T:\\.]+)", content)
-        if updated_match:
-            try:
-                session.updated_at = datetime.fromisoformat(updated_match.group(1))
-            except ValueError:
-                pass
-
-        # Parse main sections
-        problem_match = re.search(
-            "## Problem Statement\\n(.*?)(?=\\n##)", content, re.DOTALL
-        )
-        if problem_match:
-            session.problem = problem_match.group(1).strip()
-
-        success_match = re.search(
-            "## Success Criteria\\n(.*?)(?=\\n##)", content, re.DOTALL
-        )
-        if success_match:
-            session.success_criteria = success_match.group(1).strip()
-
-        constraints_match = re.search(
-            "## Constraints\\n(.*?)(?=\\n##)", content, re.DOTALL
-        )
-        if constraints_match:
-            session.constraints = constraints_match.group(1).strip()
-
-        codebase_match = re.search(
-            "## Codebase Context\\n(.*?)(?=\\n##)", content, re.DOTALL
-        )
-        if codebase_match:
-            session.codebase_context = codebase_match.group(1).strip()
-
-        # Parse thoughts with enhanced format
-        thoughts_section = re.search(
-            "## Thoughts.*?\\n\\n(.*)", content, re.DOTALL
-        )
-        if thoughts_section:
-            # Find all thought blocks using a more direct approach
-            thought_pattern = r"### Thought (\d+)(.*?)(?=### Thought \d+|\n##|$)"
-            thought_matches = re.findall(thought_pattern, thoughts_section.group(1), re.DOTALL)
-
-            for thought_num, block in thought_matches:
-                # Extract ID
-                id_match = re.search(r"\*\*ID:\*\* ([^\n]+)", block)
-                # Extract confidence
-                conf_match = re.search(r"\*\*Confidence:\*\* ([\d.]+)", block)
-                # Extract content (between Created line and ---)
-                content_match = re.search(r"\*\*Created:\*\* [^\n]+\n\n(.*?)(?=\n---|$)", block, re.DOTALL)
-
-                if id_match and conf_match and content_match:
-                    thought_num_match = re.search(r"\*\*Thought:\*\* (\d+)/(\d+)", block)
-                    revision_match = re.search(r"\*\*Revision of:\*\* ([^\n]+)", block)
-                    next_needed_match = re.search(r"\*\*Next Needed:\*\* False", block)
-                    stage_match = re.search(r"\*\*Stage:\*\* ([^\n]+)", block)
-                    tags_match = re.search(r"\*\*Tags:\*\* ([^\n]+)", block)
-                    axioms_match = re.search(r"\*\*Axioms:\*\* ([^\n]+)", block)
-                    assumptions_match = re.search(r"\*\*Assumptions:\*\* ([^\n]+)", block)
-                    left_match = re.search(r"\*\*Left to do:\*\* ([^\n]+)", block)
-                    thought = Thought(
-                        id=id_match.group(1).strip(),
-                        session_id=session_id,
-                        content=content_match.group(1).strip(),
-                        confidence=float(conf_match.group(1)),
-                        thought_number=int(thought_num_match.group(1)) if thought_num_match else None,
-                        total_thoughts=int(thought_num_match.group(2)) if thought_num_match else None,
-                        is_revision=bool(revision_match),
-                        revises_thought_id=revision_match.group(1).strip() if revision_match else "",
-                        next_thought_needed=not bool(next_needed_match),
-                        stage=ThoughtStage.from_string(stage_match.group(1).strip()) if stage_match else None,
-                        tags=[t.strip() for t in tags_match.group(1).split(",") if t.strip()] if tags_match else [],
-                        axioms_used=axioms_match.group(1).strip() if axioms_match else "",
-                        assumptions_challenged=assumptions_match.group(1).strip() if assumptions_match else "",
-                        left_to_be_done=left_match.group(1).strip() if left_match else "",
-                    )
-                    session.thoughts.append(thought)
-
-        # Parse architecture decisions with enhanced format
-        decisions_section = re.search(
-            "## Architecture Decisions.*?\\n\\n(.*)", content, re.DOTALL
-        )
-        if decisions_section:
-            # Find all decision blocks
-            decision_pattern = r"### ([^\n]+)(.*?)(?=### [^\n]+\n\n|\n##|$)"
-            decision_matches = re.findall(decision_pattern, decisions_section.group(1), re.DOTALL)
-
-            for title, block in decision_matches:
-                # Extract decision fields
-                id_match = re.search(r"\*\*ID:\*\* ([^\n]+)", block)
-                context_match = re.search(r"\*\*Context:\*\* ([^\n]+)", block)
-                options_match = re.search(r"\*\*Options Considered:\*\* ([^\n]+)", block)
-                chosen_match = re.search(r"\*\*Chosen Option:\*\* ([^\n]+)", block)
-                rationale_match = re.search(r"\*\*Rationale:\*\* ([^\n]+)", block)
-                consequences_match = re.search(r"\*\*Consequences:\*\* ([^\n]+)", block)
-                packages_match = re.search(r"\*\*Package Dependencies:\*\* ([^\n]+)", block)
-
-                if all([id_match, context_match, options_match, chosen_match, rationale_match, consequences_match]):
-                    decision = ArchitectureDecision(
-                        id=id_match.group(1).strip(),
-                        session_id=session_id,
-                        decision_title=title.strip(),
-                        context=context_match.group(1).strip(),
-                        options_considered=options_match.group(1).strip(),
-                        chosen_option=chosen_match.group(1).strip(),
-                        rationale=rationale_match.group(1).strip(),
-                        consequences=consequences_match.group(1).strip(),
-                        package_dependencies=packages_match.group(1).strip().split(", ") if packages_match and packages_match.group(1).strip() else [],
-                    )
-                    session.architecture_decisions.append(decision)
-
-        # Parse discovered packages
-        packages_section = re.search(
-            "## Discovered Packages.*?\\n(.*?)(?=\\n##|$)", content, re.DOTALL
-        )
-        if packages_section:
-            package_blocks = re.findall(
-                "### ([^\\s]+) v([^\\n]+)\\n.*?\\*\\*Relevance Score:\\*\\* ([\\d.]+)\\n.*?\\*\\*Status:\\*\\* ([^\\n]+)",
-                packages_section.group(1),
-                re.DOTALL
-            )
-            for name, version, relevance, status in package_blocks:
-                package = PackageInfo(
-                    name=name.strip(),
-                    version=version.strip(),
-                    relevance_score=float(relevance),
-                    installation_status=status.strip(),
-                    session_id=session_id,
-                )
-                session.discovered_packages.append(package)
-
-        return session
-
-    def _load_session_memories(self, session_id: str) -> None:
-        if not self.current_session:
-            return
-        memory_files = list(self.memories_dir.glob("*.md"))
-        for memory_file in memory_files:
-            content = memory_file.read_text()
-            session_match = re.search("\\*\\*Session ID:\\*\\* ([\\w\\-]+)", content)
-            if session_match and session_match.group(1) == session_id:
-                memory_id = memory_file.stem
-                memory_content_match = re.search(
-                    "## Content\\n(.*?)(?=\\n##)", content, re.DOTALL
-                )
-                memory_content = (
-                    memory_content_match.group(1).strip()
-                    if memory_content_match
-                    else ""
-                )
-                tags_match = re.search(
-                    "## Tags\\n(.*?)(?=\\n##|\\n---)", content, re.DOTALL
-                )
-                tags = []
-                if tags_match:
-                    tags_text = tags_match.group(1).strip()
-                    if tags_text:
-                        tags = [tag.strip() for tag in tags_text.split(",")]
-                memory = Memory(
-                    id=memory_id,
-                    session_id=session_id,
-                    content=memory_content,
-                    tags=tags,
-                )
-                code_match = re.search(
-                    "## Code Snippet\\n```(\\w*)\\n(.*?)```", content, re.DOTALL
-                )
-                if code_match:
-                    memory.language = code_match.group(1)
-                    memory.code_snippet = code_match.group(2).strip()
-                self.current_session.memories.append(memory)
-
     def _load_last_active_session(self) -> None:
         try:
             sessions = self.list_sessions()
             if sessions:
-                latest_session_id = sessions[0]["id"]
-                self.load_session(latest_session_id)
+                self.load_session(sessions[0]["id"])
         except Exception:
             pass
+
+    def verify_assumption(self, assumption_id: str, is_true: bool) -> Optional[str]:
+        if not self.current_session:
+            raise NoActiveSessionError("Cannot verify assumption without an active session")
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM assumptions WHERE id = ? AND session_id = ?",
+                    (assumption_id, self.current_session.id),
+                ).fetchone()
+                if not row:
+                    return None
+                status = "verified" if is_true else "falsified"
+                conn.execute(
+                    "UPDATE assumptions SET verification_status = ? WHERE id = ?",
+                    (status, assumption_id),
+                )
+            return assumption_id
+        except Exception as e:
+            self.logger.error(f"Failed to verify assumption: {e}")
+            raise SessionError(f"Could not verify assumption: {e}")
+
+    def get_session_assumptions(self) -> Dict[str, Any]:
+        if not self.current_session:
+            return {"error": "No active session"}
+        try:
+            with self._conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM assumptions WHERE session_id = ?",
+                    (self.current_session.id,),
+                ).fetchall()
+            assumptions = [self._row_to_assumption(r) for r in rows]
+            risky = [a.id for a in assumptions if a.is_risky]
+            falsified = [a.id for a in assumptions if a.is_falsified]
+            return {
+                "assumptions": [
+                    {
+                        "id": a.id,
+                        "text": a.text,
+                        "confidence": a.confidence,
+                        "critical": a.critical,
+                        "verifiable": a.verifiable,
+                        "verification_status": a.verification_status,
+                        "is_risky": a.is_risky,
+                    }
+                    for a in assumptions
+                ],
+                "risky_assumptions": risky,
+                "falsified_assumptions": falsified,
+                "count": len(assumptions),
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to get assumptions: {e}")
+            return {"error": str(e)}

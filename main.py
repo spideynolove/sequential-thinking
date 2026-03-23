@@ -41,7 +41,7 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="add_thought",
-            description="Add a new thought to the current session with optional package exploration",
+            description="Add a new thought to the current session with optional package exploration, assumptions tracking, uncertainty notes, and outcome",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -50,6 +50,25 @@ async def list_tools() -> List[Tool]:
                     "confidence": {"type": "number", "default": 0.8},
                     "dependencies": {"type": "string", "default": ""},
                     "explore_packages": {"type": "boolean", "default": False},
+                    "thought_number": {"type": "number", "default": None},
+                    "total_thoughts": {"type": "number", "default": None},
+                    "is_revision": {"type": "boolean", "default": False},
+                    "revises_thought_id": {"type": "string", "default": ""},
+                    "next_thought_needed": {"type": "boolean", "default": True},
+                    "stage": {
+                        "type": "string",
+                        "default": "",
+                        "enum": ["problem_definition", "research", "analysis", "synthesis", "conclusion", ""],
+                    },
+                    "tags": {"type": "string", "default": ""},
+                    "axioms_used": {"type": "string", "default": ""},
+                    "assumptions_challenged": {"type": "string", "default": ""},
+                    "left_to_be_done": {"type": "string", "default": ""},
+                    "uncertainty_notes": {"type": "string", "default": ""},
+                    "outcome": {"type": "string", "default": ""},
+                    "assumptions": {"type": "string", "default": ""},
+                    "depends_on_assumptions": {"type": "string", "default": ""},
+                    "invalidates_assumptions": {"type": "string", "default": ""},
                 },
                 "required": ["content"],
             },
@@ -188,6 +207,23 @@ async def list_tools() -> List[Tool]:
         Tool(
             name="analyze_session",
             description="Analyze current session completeness and insights",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="verify_assumption",
+            description="Verify an assumption as true or false",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "assumption_id": {"type": "string"},
+                    "is_true": {"type": "boolean"},
+                },
+                "required": ["assumption_id", "is_true"],
+            },
+        ),
+        Tool(
+            name="get_assumptions",
+            description="Get all assumptions for the current session with risk indicators",
             inputSchema={"type": "object", "properties": {}},
         ),
     ]

@@ -62,12 +62,18 @@ class MCPToolsHandler:
         axioms_used: str = "",
         assumptions_challenged: str = "",
         left_to_be_done: str = "",
+        uncertainty_notes: str = "",
+        outcome: str = "",
+        assumptions: str = "",
+        depends_on_assumptions: str = "",
+        invalidates_assumptions: str = "",
     ) -> Dict[str, Any]:
         try:
             thought_id = self.session_manager.add_thought(
                 content, branch_id, confidence, dependencies, explore_packages,
                 thought_number, total_thoughts, is_revision, revises_thought_id, next_thought_needed,
                 stage, tags, axioms_used, assumptions_challenged, left_to_be_done,
+                uncertainty_notes, outcome, assumptions, depends_on_assumptions, invalidates_assumptions,
             )
             if is_revision:
                 thought_type = ThoughtType.REVISION.value
@@ -99,6 +105,16 @@ class MCPToolsHandler:
                 result["assumptions_challenged"] = assumptions_challenged
             if left_to_be_done:
                 result["left_to_be_done"] = left_to_be_done
+            if uncertainty_notes:
+                result["uncertainty_notes"] = uncertainty_notes
+            if outcome:
+                result["outcome"] = outcome
+            if assumptions:
+                result["assumptions"] = [a.strip() for a in assumptions.split(",") if a.strip()]
+            if depends_on_assumptions:
+                result["depends_on_assumptions"] = [d.strip() for d in depends_on_assumptions.split(",") if d.strip()]
+            if invalidates_assumptions:
+                result["invalidates_assumptions"] = [i.strip() for i in invalidates_assumptions.split(",") if i.strip()]
             return result
         except Exception as e:
             return {"error": str(e)}
@@ -215,7 +231,6 @@ class MCPToolsHandler:
         tags: str = "",
     ) -> Dict[str, Any]:
         try:
-            # Validate inputs
             if not filename or not filename.strip():
                 raise ValidationError("Export filename cannot be empty")
 
@@ -270,6 +285,24 @@ class MCPToolsHandler:
         try:
             analysis = self.session_manager.analyze_session()
             return analysis
+        except Exception as e:
+            return {"error": str(e)}
+
+    def verify_assumption(self, assumption_id: str, is_true: bool) -> Dict[str, Any]:
+        try:
+            result = self.session_manager.verify_assumption(assumption_id, is_true)
+            if result is None:
+                return {"error": f"Assumption {assumption_id} not found"}
+            return {
+                "assumption_id": result,
+                "verification_status": "verified" if is_true else "falsified",
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_assumptions(self) -> Dict[str, Any]:
+        try:
+            return self.session_manager.get_session_assumptions()
         except Exception as e:
             return {"error": str(e)}
 

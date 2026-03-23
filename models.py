@@ -36,6 +36,36 @@ class ThoughtStage(Enum):
 
 
 @dataclass
+class Assumption:
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    session_id: str = ""
+    text: str = ""
+    confidence: float = 0.8
+    critical: bool = False
+    verifiable: bool = False
+    evidence: str = ""
+    verification_status: str = ""
+
+    def __post_init__(self):
+        if not self.text or not self.text.strip():
+            raise ValidationError("Assumption text cannot be empty")
+        if self.confidence < 0 or self.confidence > 1:
+            raise ValidationError("Assumption confidence must be between 0 and 1")
+
+    @property
+    def is_verified(self) -> bool:
+        return self.verification_status == "verified"
+
+    @property
+    def is_falsified(self) -> bool:
+        return self.verification_status == "falsified"
+
+    @property
+    def is_risky(self) -> bool:
+        return self.critical and self.confidence < 0.7 and not self.is_verified
+
+
+@dataclass
 class UnifiedSession:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     problem: str = ""
@@ -68,7 +98,6 @@ class Memory:
     updated_at: datetime = field(default_factory=datetime.now)
 
     def __post_init__(self):
-        """Validate memory data after initialization."""
         if not self.content or not self.content.strip():
             raise ValidationError("Memory content cannot be empty")
 
@@ -78,7 +107,6 @@ class Memory:
         if self.importance < 0 or self.importance > 1:
             raise ValidationError("Memory importance must be between 0 and 1")
 
-        # Ensure tags is always a list
         if isinstance(self.tags, str):
             if self.tags.strip():
                 self.tags = [tag.strip() for tag in self.tags.split(",") if tag.strip()]
@@ -106,6 +134,11 @@ class Thought:
     axioms_used: str = ""
     assumptions_challenged: str = ""
     left_to_be_done: str = ""
+    uncertainty_notes: str = ""
+    outcome: str = ""
+    assumptions: List[str] = field(default_factory=list)
+    depends_on_assumptions: List[str] = field(default_factory=list)
+    invalidates_assumptions: List[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
 
