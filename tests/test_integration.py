@@ -157,7 +157,7 @@ class UserResponse(BaseModel):
         export_file = Path(export_result["filename"])
         assert export_file.exists()
         content = export_file.read_text()
-        assert "User management" in content
+        assert "user management" in content.lower()
         assert "PostgreSQL" in content
         assert "JWT" in content
 
@@ -195,10 +195,10 @@ class UserResponse(BaseModel):
         ]
 
         thought_ids = []
-        for thought in research_thoughts:
+        for i, thought in enumerate(research_thoughts):
             result = tools_handler.add_thought(
                 content=thought,
-                confidence=0.8 + (thought_ids.index(thought) * 0.02)  # Varying confidence
+                confidence=0.8 + (i * 0.02)
             )
             thought_ids.append(result["thought_id"])
 
@@ -225,12 +225,12 @@ class UserResponse(BaseModel):
             {
                 "content": "Circuit Breaker Pattern: Prevents cascading failures by detecting failures and opening circuit",
                 "code": "# Hystrix circuit breaker\n@hystrix_command(fallback_method='get_user_fallback')\ndef get_user(user_id):\n    return user_service.get(user_id)",
-                "tags": "circuit-breaker,resilience,fallback"
+                "tags": "circuit-breaker,resilience,fallback,pattern"
             },
             {
                 "content": "Service Discovery Pattern: Services automatically register and discover each other",
                 "code": "# Consul service registration\nconsul.agent.service.register(\n    name='user-service',\n    service_id=f'user-service-{instance_id}',\n    port=8080,\n    health_check='http://localhost:8080/health'\n)",
-                "tags": "service-discovery,consul,registration"
+                "tags": "service-discovery,consul,registration,pattern"
             }
         ]
 

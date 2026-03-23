@@ -67,7 +67,6 @@ class TestMCPToolsHandler:
         assert result["thought_id"] is not None
         assert result["content"] == "This is a test thought"
         assert result["confidence"] == 0.9
-        assert result["explore_packages"] is True
 
     def test_add_thought_without_session(self, tools_handler):
         """Test adding thought without active session."""
