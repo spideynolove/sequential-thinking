@@ -166,6 +166,17 @@ class UnifiedSessionManager:
                     created_at TEXT NOT NULL
                 )
             """)
+            for col, defn in [
+                ("uncertainty_notes", "TEXT NOT NULL DEFAULT ''"),
+                ("outcome", "TEXT NOT NULL DEFAULT ''"),
+                ("assumptions", "TEXT NOT NULL DEFAULT ''"),
+                ("depends_on_assumptions", "TEXT NOT NULL DEFAULT ''"),
+                ("invalidates_assumptions", "TEXT NOT NULL DEFAULT ''"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE thoughts ADD COLUMN {col} {defn}")
+                except Exception:
+                    pass
             conn.commit()
         finally:
             conn.close()
@@ -310,11 +321,11 @@ class UnifiedSessionManager:
             axioms_used=row["axioms_used"] or "",
             assumptions_challenged=row["assumptions_challenged"] or "",
             left_to_be_done=row["left_to_be_done"] or "",
-            uncertainty_notes=row.get("uncertainty_notes") or "",
-            outcome=row.get("outcome") or "",
-            assumptions=[a for a in (row.get("assumptions") or "").split(",") if a],
-            depends_on_assumptions=[a for a in (row.get("depends_on_assumptions") or "").split(",") if a],
-            invalidates_assumptions=[a for a in (row.get("invalidates_assumptions") or "").split(",") if a],
+            uncertainty_notes=row["uncertainty_notes"] or "",
+            outcome=row["outcome"] or "",
+            assumptions=[a for a in (row["assumptions"] or "").split(",") if a],
+            depends_on_assumptions=[a for a in (row["depends_on_assumptions"] or "").split(",") if a],
+            invalidates_assumptions=[a for a in (row["invalidates_assumptions"] or "").split(",") if a],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
@@ -379,8 +390,8 @@ class UnifiedSessionManager:
             confidence=row["confidence"],
             critical=bool(row["critical"]),
             verifiable=bool(row["verifiable"]),
-            evidence=row.get("evidence") or "",
-            verification_status=row.get("verification_status") or "",
+            evidence=row["evidence"] or "",
+            verification_status=row["verification_status"] or "",
         )
 
     def start_session(
