@@ -14,7 +14,7 @@ from models import (
 )
 from errors import (
     SessionError, NoActiveSessionError, SessionNotFoundError,
-    ValidationError, StorageError, BranchError,
+    ValidationError, StorageError, BranchError, make_error,
 )
 
 MAX_THOUGHTS_PER_SESSION = 500
@@ -172,9 +172,18 @@ class UnifiedSessionManager:
                 ("assumptions", "TEXT NOT NULL DEFAULT ''"),
                 ("depends_on_assumptions", "TEXT NOT NULL DEFAULT ''"),
                 ("invalidates_assumptions", "TEXT NOT NULL DEFAULT ''"),
+                ("tag_uncertainty", "TEXT NOT NULL DEFAULT ''"),
+                ("tag_assumptions", "TEXT NOT NULL DEFAULT ''"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE thoughts ADD COLUMN {col} {defn}")
+                except Exception:
+                    pass
+            for col, defn in [
+                ("status", "TEXT NOT NULL DEFAULT ''"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE branches ADD COLUMN {col} {defn}")
                 except Exception:
                     pass
             conn.commit()
@@ -511,6 +520,17 @@ class UnifiedSessionManager:
     def create_branch(self, name: str, from_thought: str, purpose: str) -> str:
         if not self.current_session:
             raise NoActiveSessionError("Cannot create branch without an active session")
+        if from_thought and from_thought.strip():
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT session_id FROM thoughts WHERE id = ?", (from_thought.strip(),)
+                ).fetchone()
+                if row and row["session_id"] != self.current_session.id:
+                    raise Exception(make_error(
+                        "cross_session_reference",
+                        f"Thought '{from_thought}' belongs to a different session",
+                        {"field": "from_thought_id"},
+                    )["error"])
         try:
             if not name or not name.strip():
                 raise ValidationError("Branch name cannot be empty")
@@ -855,8 +875,8 @@ class UnifiedSessionManager:
         try:
             with self._conn() as conn:
                 row = conn.execute(
-                    "SELECT * FROM assumptions WHERE id = ? AND session_id = ?",
-                    (assumption_id, self.current_session.id),
+                    "SELECT * FROM assumptions WHERE id = ?",
+                    (assumption_id,),
                 ).fetchone()
                 if not row:
                     return None
@@ -869,6 +889,176 @@ class UnifiedSessionManager:
         except Exception as e:
             self.logger.error(f"Failed to verify assumption: {e}")
             raise SessionError(f"Could not verify assumption: {e}")
+
+    def revise_thought(self, thought_id: str, content: str) -> bool:
+        try:
+            content = _sanitize_input(content, MAX_THOUGHT_CONTENT_LENGTH, "content")
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM thoughts WHERE id = ?", (thought_id,)
+                ).fetchone()
+                if not row:
+                    return False
+                conn.execute(
+                    "UPDATE thoughts SET content = ?, updated_at = ? WHERE id = ?",
+                    (content, datetime.now().isoformat(), thought_id),
+                )
+            if self.current_session:
+                for thought in self.current_session.thoughts:
+                    if thought.id == thought_id:
+                        thought.content = content
+                        thought.updated_at = datetime.now()
+                        break
+            return True
+        except ValidationError:
+            raise
+        except Exception as e:
+            self.logger.error(f"Failed to revise thought: {e}")
+            raise SessionError(f"Could not revise thought: {e}")
+
+    def get_thought(self, thought_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM thoughts WHERE id = ?", (thought_id,)
+                ).fetchone()
+                if not row:
+                    return None
+                return {
+                    "id": row["id"],
+                    "session_id": row["session_id"],
+                    "content": row["content"],
+                    "branch_id": row["branch_id"] or "",
+                    "confidence": row["confidence"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+        except Exception as e:
+            self.logger.error(f"Failed to get thought: {e}")
+            raise SessionError(f"Could not get thought: {e}")
+
+    def check_contradictions(self, session_id: str) -> Dict[str, Any]:
+        try:
+            with self._conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM thoughts WHERE session_id = ? ORDER BY created_at", (session_id,)
+                ).fetchall()
+            thoughts = [dict(r) for r in rows]
+            contradictions = []
+            for i in range(len(thoughts)):
+                for j in range(i + 1, len(thoughts)):
+                    a, b = thoughts[i]["content"].lower(), thoughts[j]["content"].lower()
+                    negation_pairs = [("is ", "is not "), ("can ", "cannot "), ("will ", "will not "), ("does ", "does not ")]
+                    for pos, neg in negation_pairs:
+                        if pos in a and neg in b:
+                            contradictions.append({"thought_a": thoughts[i]["id"], "thought_b": thoughts[j]["id"]})
+                            break
+                        if neg in a and pos in b:
+                            contradictions.append({"thought_a": thoughts[i]["id"], "thought_b": thoughts[j]["id"]})
+                            break
+            return {"contradictions": contradictions}
+        except Exception as e:
+            self.logger.error(f"Failed to check contradictions: {e}")
+            raise SessionError(f"Could not check contradictions: {e}")
+
+    def get_full_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if not row:
+                    return None
+                thought_rows = conn.execute(
+                    "SELECT * FROM thoughts WHERE session_id = ? ORDER BY created_at", (session_id,)
+                ).fetchall()
+                branch_rows = conn.execute(
+                    "SELECT * FROM branches WHERE session_id = ? ORDER BY created_at", (session_id,)
+                ).fetchall()
+            thoughts = [
+                {
+                    "id": t["id"],
+                    "content": t["content"],
+                    "branch_id": t["branch_id"] or "",
+                    "created_at": t["created_at"],
+                    "confidence": t["confidence"],
+                    "uncertainty": t["tag_uncertainty"] if "tag_uncertainty" in t.keys() else "",
+                    "tag_assumptions": [a for a in (t["tag_assumptions"] if "tag_assumptions" in t.keys() else "").split(",") if a],
+                }
+                for t in thought_rows
+            ]
+            branches = [
+                {"id": b["id"], "name": b["name"], "purpose": b["purpose"], "from_thought_id": b["from_thought_id"] or ""}
+                for b in branch_rows
+            ]
+            return {
+                "session_id": session_id,
+                "problem": row["problem"],
+                "success_criteria": row["success_criteria"],
+                "created_at": row["created_at"],
+                "thoughts": thoughts,
+                "branches": branches,
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to get full session: {e}")
+            raise SessionError(f"Could not get session: {e}")
+
+    def tag_thought(self, thought_id: str, uncertainty: str, tag_assumptions: list) -> bool:
+        try:
+            with self._conn() as conn:
+                row = conn.execute("SELECT id FROM thoughts WHERE id = ?", (thought_id,)).fetchone()
+                if not row:
+                    return False
+                conn.execute(
+                    "UPDATE thoughts SET tag_uncertainty = ?, tag_assumptions = ?, updated_at = ? WHERE id = ?",
+                    (uncertainty, ",".join(tag_assumptions), datetime.now().isoformat(), thought_id),
+                )
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to tag thought: {e}")
+            raise SessionError(f"Could not tag thought: {e}")
+
+    def find_memories_by_tag(self, tag: str) -> List[Dict[str, Any]]:
+        try:
+            with self._conn() as conn:
+                rows = conn.execute("SELECT * FROM memories ORDER BY created_at").fetchall()
+            results = []
+            for row in rows:
+                row_tags = [t.strip() for t in (row["tags"] or "").split(",") if t.strip()]
+                if not tag or any(tag.lower() in t.lower() for t in row_tags):
+                    results.append({
+                        "id": row["id"],
+                        "content": row["content"],
+                        "tags": row_tags,
+                        "confidence": row["confidence"],
+                        "session_id": row["session_id"],
+                        "created_at": row["created_at"],
+                    })
+            return results
+        except Exception as e:
+            self.logger.error(f"Failed to find memories: {e}")
+            raise SessionError(f"Could not find memories: {e}")
+
+    def resolve_branch(self, session_id: str, branch_id: str) -> bool:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT id FROM branches WHERE id = ?", (branch_id,)
+                ).fetchone()
+                if not row:
+                    return False
+                conn.execute(
+                    "UPDATE branches SET status = ? WHERE id = ?",
+                    ("resolved", branch_id),
+                )
+            if self.current_session:
+                for branch in self.current_session.branches:
+                    if branch.id == branch_id:
+                        break
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to resolve branch: {e}")
+            raise SessionError(f"Could not resolve branch: {e}")
 
     def get_session_assumptions(self) -> Dict[str, Any]:
         if not self.current_session:

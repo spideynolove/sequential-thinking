@@ -37,7 +37,7 @@ class ThoughtStage(Enum):
 
 @dataclass
 class Assumption:
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    id: str = field(default_factory=lambda: "assm_" + uuid.uuid4().hex)
     session_id: str = ""
     text: str = ""
     confidence: float = 0.8
@@ -67,7 +67,7 @@ class Assumption:
 
 @dataclass
 class UnifiedSession:
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    id: str = field(default_factory=lambda: "ses_" + uuid.uuid4().hex)
     problem: str = ""
     success_criteria: str = ""
     constraints: str = ""
@@ -116,7 +116,7 @@ class Memory:
 
 @dataclass
 class Thought:
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    id: str = field(default_factory=lambda: "thoug_" + uuid.uuid4().hex)
     session_id: str = ""
     branch_id: str = ""
     content: str = ""
@@ -166,7 +166,7 @@ class Thought:
 
 @dataclass
 class Branch:
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    id: str = field(default_factory=lambda: "bran_" + uuid.uuid4().hex)
     name: str = ""
     purpose: str = ""
     session_id: str = ""

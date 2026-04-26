@@ -7,6 +7,8 @@ from errors import (
     NoActiveSessionError,
     ValidationError,
     ExportError,
+    make_error,
+    validate_id_format,
 )
 
 
@@ -47,7 +49,7 @@ class MCPToolsHandler:
 
     def add_thought(
         self,
-        content: str,
+        content: Optional[str] = None,
         branch_id: str = "",
         confidence: float = 0.8,
         dependencies: str = "",
@@ -68,6 +70,10 @@ class MCPToolsHandler:
         depends_on_assumptions: str = "",
         invalidates_assumptions: str = "",
     ) -> Dict[str, Any]:
+        if content is None:
+            return make_error("validation_error", "Missing required field: content", {"field": "content"})
+        if not self.session_manager.current_session:
+            return make_error("no_active_session", "No active session. Call start_session first.", {})
         try:
             thought_id = self.session_manager.add_thought(
                 content, branch_id, confidence, dependencies, explore_packages,
@@ -141,6 +147,84 @@ class MCPToolsHandler:
                 "target_thought": target_thought,
                 "status": "merged",
             }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def revise_thought(self, thought_id: str, content: str) -> Dict[str, Any]:
+        err = validate_id_format(thought_id, "thought")
+        if err:
+            return err
+        try:
+            found = self.session_manager.revise_thought(thought_id, content)
+            if not found:
+                return make_error("thought_not_found", f"Thought '{thought_id}' not found", {"thought_id": thought_id})
+            return {"success": True, "thought_id": thought_id}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_thought(self, thought_id: str) -> Dict[str, Any]:
+        err = validate_id_format(thought_id, "thought")
+        if err:
+            return err
+        try:
+            result = self.session_manager.get_thought(thought_id)
+            if result is None:
+                return make_error("thought_not_found", f"Thought '{thought_id}' not found", {"thought_id": thought_id})
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def check_contradictions(self, session_id: str) -> Dict[str, Any]:
+        err = validate_id_format(session_id, "session")
+        if err:
+            return err
+        try:
+            return self.session_manager.check_contradictions(session_id)
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_session(self, session_id: str) -> Dict[str, Any]:
+        err = validate_id_format(session_id, "session")
+        if err:
+            return err
+        try:
+            result = self.session_manager.get_full_session(session_id)
+            if result is None:
+                return make_error("session_not_found", f"Session '{session_id}' not found", {"session_id": session_id})
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def tag_thought(self, thought_id: str, tag: Dict[str, Any]) -> Dict[str, Any]:
+        err = validate_id_format(thought_id, "thought")
+        if err:
+            return err
+        try:
+            uncertainty = tag.get("uncertainty", "") if isinstance(tag, dict) else ""
+            assumptions = tag.get("assumptions", []) if isinstance(tag, dict) else []
+            found = self.session_manager.tag_thought(thought_id, uncertainty, assumptions)
+            if not found:
+                return make_error("thought_not_found", f"Thought '{thought_id}' not found", {"thought_id": thought_id})
+            return {"success": True}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def find_memories(self, tag: str = "") -> Dict[str, Any]:
+        try:
+            memories = self.session_manager.find_memories_by_tag(tag)
+            return {"memories": memories, "count": len(memories)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def resolve_branch(self, session_id: str, branch_id: str) -> Dict[str, Any]:
+        err = validate_id_format(branch_id, "branch")
+        if err:
+            return err
+        try:
+            found = self.session_manager.resolve_branch(session_id, branch_id)
+            if not found:
+                return make_error("branch_not_found", f"Branch '{branch_id}' not found", {"branch_id": branch_id})
+            return {"success": True, "status": "resolved"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -289,10 +373,13 @@ class MCPToolsHandler:
             return {"error": str(e)}
 
     def verify_assumption(self, assumption_id: str, is_true: bool) -> Dict[str, Any]:
+        err = validate_id_format(assumption_id, "assumption")
+        if err:
+            return err
         try:
             result = self.session_manager.verify_assumption(assumption_id, is_true)
             if result is None:
-                return {"error": f"Assumption {assumption_id} not found"}
+                return make_error("assumption_not_found", f"Assumption '{assumption_id}' not found", {"assumption_id": assumption_id})
             return {
                 "assumption_id": result,
                 "verification_status": "verified" if is_true else "falsified",
