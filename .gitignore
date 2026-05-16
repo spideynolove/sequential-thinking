@@ -206,7 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-COMMENTs.md
-Reviewer-sample.md
-SUMMARY.md
-Worker-sample.md
+# user define
+docs/
+test/
+.claude/
